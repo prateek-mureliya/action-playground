@@ -1,0 +1,1333 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import platform
+import socket
+import time
+from functools import total_ordering
+
+import pytest
+import redis
+from packaging import version
+
+import coredis
+import coredis.connection
+import coredis.experimental
+import coredis.parser
+import coredis.sentinel
+from coredis import BlockingConnectionPool
+from coredis._utils import EncodingInsensitiveDict, b, hash_slot, nativestr
+from coredis.cache import TrackingCache
+from coredis.response._callbacks import NoopCallback
+from coredis.typing import RUNTIME_TYPECHECKS, Callable, Optional, R, ValueT
+
+REDIS_VERSIONS = {}
+MODULE_VERSIONS = {}
+PY_IMPLEMENTATION = platform.python_implementation()
+PY_VERSION = version.Version(platform.python_version())
+DOCKER_TAG_MAPPING = {
+    "6.0": {
+        "default": "6.0.16",
+        "stack": "6.2.2-v5",
+    },
+    "6.2": {
+        "default": "6.2.6",
+        "stack": "6.2.2-v5",
+    },
+    "7.0": {"default": "7.0.0", "stack": "7.0.6-RC8"},
+    "latest": {"default": "latest", "stack": "latest"},
+    "next": {
+        "standalone": "7.2-rc2",
+        "ssl": "7.2-rc2",
+        "stack": "edge",
+        "default": "latest",
+    },
+}
+
+SERVER_DEFAULT_ARGS = {
+    "6.0": "",
+    "6.2": "",
+    "7.0": None,
+}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def uvloop():
+    if os.environ.get("COREDIS_UVLOOP") == "True":
+        import uvloop
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+
+@pytest.fixture(scope="function")
+def event_loop():
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+
+    for task in [t for t in asyncio.all_tasks(loop) if not (t.done() or t.cancelled())]:
+        task.cancel()
+        try:
+            loop.run_until_complete(task)
+        except:  # noqa
+            pass
+    loop.close()
+
+
+@total_ordering
+class UnparseableVersion:
+    def __init__(self, version: str):
+        self.version = version
+
+    def __str__(self):
+        return self.version
+
+    def __eq__(self, other):
+        return str(other) == self.version
+
+    def __lt__(self, other):
+        return True
+
+
+async def get_module_versions(client):
+    if str(client) not in MODULE_VERSIONS:
+        MODULE_VERSIONS[str(client)] = {}
+        try:
+            module_list = await client.module_list()
+
+            for module in module_list:
+                mod = EncodingInsensitiveDict(module)
+                name = nativestr(mod["name"])
+                ver = mod["ver"]
+                ver, patch = divmod(ver, 100)
+                ver, minor = divmod(ver, 100)
+                ver, major = divmod(ver, 100)
+                MODULE_VERSIONS.setdefault(str(client), {})[name] = version.Version(
+                    f"{major}.{minor}.{patch}"
+                )
+        except Exception:
+            pass
+
+    return MODULE_VERSIONS[str(client)]
+
+
+async def get_version(client):
+    if str(client) not in REDIS_VERSIONS:
+        try:
+            if isinstance(client, coredis.RedisCluster):
+                await client
+                node = list(client.primaries).pop()
+                version_string = (await node.info())["redis_version"]
+                REDIS_VERSIONS[str(client)] = version.parse(version_string)
+            elif isinstance(client, coredis.sentinel.Sentinel):
+                version_string = (await client.sentinels[0].info())["redis_version"]
+                REDIS_VERSIONS[str(client)] = version.parse(version_string)
+            else:
+                client_info = await client.info()
+
+                if "dfly_version" in client_info:
+                    version_string = client_info["dfly_version"]
+                else:
+                    version_string = client_info["redis_version"]
+                REDIS_VERSIONS[str(client)] = version.parse(version_string)
+        except version.InvalidVersion:
+            REDIS_VERSIONS[str(client)] = UnparseableVersion(version_string)
+
+    return REDIS_VERSIONS[str(client)]
+
+
+async def check_test_constraints(request, client, protocol=3):
+    await get_version(client)
+    await get_module_versions(client)
+    client_version = REDIS_VERSIONS[str(client)]
+
+    for marker in request.node.iter_markers():
+        if marker.name == "min_python" and marker.args:
+            if PY_VERSION < version.parse(marker.args[0]):
+                return pytest.skip(f"Skipped for python versions < {marker.args[0]}")
+
+        if marker.name == "min_server_version" and marker.args:
+            if client_version < version.parse(marker.args[0]):
+                return pytest.skip(f"Skipped for versions < {marker.args[0]}")
+
+        if marker.name == "max_server_version" and marker.args:
+            if client_version > version.parse(marker.args[0]):
+                return pytest.skip(f"Skipped for versions > {marker.args[0]}")
+
+        if marker.name == "min_module_version" and marker.args:
+            name, ver = marker.args[0], marker.args[1]
+            cur_ver = MODULE_VERSIONS.get(str(client), {}).get(name)
+
+            if not cur_ver or cur_ver < version.parse(ver):
+                return pytest.skip(f"Skipped for module {name} versions < {ver}")
+
+        if marker.name == "max_module_version" and marker.args:
+            name, ver = marker.args[0], marker.args[1]
+            cur_ver = MODULE_VERSIONS.get(str(client), {}).get(name)
+
+            if not cur_ver or cur_ver > version.parse(ver):
+                return pytest.skip(f"Skipped for module {name} versions > {ver}")
+
+        if marker.name == "nocluster" and isinstance(client, coredis.RedisCluster):
+            return pytest.skip("Skipped for redis cluster")
+
+        if marker.name == "replicated_clusteronly":
+            is_cluster = isinstance(client, coredis.RedisCluster)
+
+            if not is_cluster or not any(
+                node.server_type == "replica"
+                for _, node in client.connection_pool.nodes.nodes.items()
+            ):
+                return pytest.skip("Skipped for non replicated cluster")
+
+        if marker.name == "noruntimechecks" and RUNTIME_TYPECHECKS:
+            return pytest.skip("Skipped with runtime checks enabled")
+
+        if marker.name == "clusteronly" and not isinstance(
+            client, coredis.RedisCluster
+        ):
+            return pytest.skip("Skipped for non redis cluster")
+
+        if (
+            marker.name == "os"
+            and not marker.args[0].lower() == platform.system().lower()
+        ):
+            return pytest.skip(f"Skipped for {platform.system()}")
+
+        if protocol == 3 and client_version < version.parse("6.0.0"):
+            return pytest.skip(f"Skipped RESP3 for {client_version}")
+
+        if marker.name == "noresp3" and protocol == 3:
+            return pytest.skip("Skipped for RESP3")
+
+        if marker.name == "nokeydb" and isinstance(client, coredis.experimental.KeyDB):
+            return pytest.skip("Skipped for KeyDB")
+
+        if marker.name == "nodragonfly" and str(client_version).startswith("df"):
+            return pytest.skip("Skipped for Dragonfly")
+
+        if marker.name == "nopypy" and PY_IMPLEMENTATION == "PyPy":
+            return pytest.skip("Skipped for PyPy")
+
+        if marker.name == "pypyonly" and PY_IMPLEMENTATION != "PyPy":
+            return pytest.skip("Skipped for !PyPy")
+
+
+async def set_default_test_config(client):
+    await get_version(client)
+
+    if isinstance(client, coredis.sentinel.Sentinel):
+        if REDIS_VERSIONS[str(client)] >= version.parse("6.2.0"):
+            await client.sentinels[0].sentinel_config_set("resolve-hostnames", "yes")
+    else:
+        await client.config_set({"maxmemory-policy": "noeviction"})
+        await client.config_set({"latency-monitor-threshold": 10})
+
+        if REDIS_VERSIONS[str(client)] >= version.parse("6.0.0"):
+            await client.acl_log(reset=True)
+
+
+def get_client_test_args(request):
+    if "client_arguments" in request.fixturenames:
+        return request.getfixturevalue("client_arguments")
+
+    return {"stream_timeout": 5, "connect_timeout": 1}
+
+
+def get_remapped_slots(request):
+    if "cluster_remap_keyslots" in request.fixturenames:
+        return request.getfixturevalue("cluster_remap_keyslots")
+
+    return []
+
+
+@contextlib.asynccontextmanager
+async def remapped_slots(client, request):
+    keys = get_remapped_slots(request)
+    slots = set([hash_slot(b(key)) for key in keys])
+    sources = {}
+    destinations = {}
+    originals = {}
+    moves = {}
+
+    for slot in slots:
+        sources[slot] = client.connection_pool.nodes.node_from_slot(slot)
+        destinations[slot] = [
+            k
+            for k in client.connection_pool.nodes.all_primaries()
+            if k != sources[slot]
+        ][0]
+        originals[slot] = sources[slot].node_id
+        moves[slot] = destinations[slot].node_id
+    try:
+        for slot in moves.keys():
+            [await p.cluster_setslot(slot, node=moves[slot]) for p in client.primaries]
+        yield
+    finally:
+        if originals:
+            await client.flushall()
+
+            for slot in originals.keys():
+                [
+                    await p.cluster_setslot(slot, node=originals[slot])
+                    for p in client.primaries
+                ]
+
+
+def check_redis_cluster_ready(host, port):
+    try:
+        return redis.Redis(host, port).cluster("info")["cluster_state"] == "ok"
+    except Exception:
+        return False
+
+
+def check_sentinel_auth_ready(host, port):
+    return ping_socket(host, 36379)
+
+
+def ping_socket(host, port):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((host, port))
+
+        return True
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="session")
+def host_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+
+    return ip
+
+
+@pytest.fixture(scope="session")
+def host_ip_env(host_ip):
+    os.environ["HOST_IP"] = str(host_ip)
+
+
+@pytest.fixture(scope="session")
+def docker_tags():
+    redis_server_version = os.environ.get("COREDIS_REDIS_VERSION", "latest")
+    mapping = DOCKER_TAG_MAPPING.get(redis_server_version, {"default": "latest"})
+    os.environ.setdefault(
+        "REDIS_VERSION", mapping.get("standalone", mapping.get("default"))
+    )
+    os.environ.setdefault(
+        "REDIS_SENTINEL_VERSION", mapping.get("sentinel", mapping.get("default"))
+    )
+    os.environ.setdefault(
+        "REDIS_SSL_VERSION", mapping.get("ssl", mapping.get("default"))
+    )
+    os.environ.setdefault(
+        "REDIS_STACK_VERSION", mapping.get("stack", mapping.get("default"))
+    )
+
+    args = SERVER_DEFAULT_ARGS.get(redis_server_version, None)
+
+    if args is not None:
+        os.environ.setdefault("DEFAULT_ARGS", args)
+
+
+@pytest.fixture(scope="session")
+def docker_services(host_ip_env, docker_tags, docker_services):
+    return docker_services
+
+
+@pytest.fixture(scope="session")
+def redis_basic_server(docker_services):
+    docker_services.start("redis-basic")
+    docker_services.wait_for_service("redis-basic", 6379, ping_socket)
+    yield ["localhost", 6379]
+
+
+@pytest.fixture(scope="session")
+def redis_uds_server(docker_services):
+    if platform.system().lower() == "darwin":
+        pytest.skip("Fixture not supported on OSX")
+    docker_services.start("redis-uds")
+    yield "/tmp/coredis.redis.sock"
+
+
+@pytest.fixture(scope="session")
+def redis_auth_server(docker_services):
+    docker_services.start("redis-auth")
+    yield ["localhost", 6389]
+
+
+@pytest.fixture(scope="session")
+def redis_ssl_server(docker_services):
+    docker_services.start("redis-ssl")
+    yield ["localhost", 8379]
+
+
+@pytest.fixture(scope="session")
+def redis_cluster_server(docker_services):
+    docker_services.start("redis-cluster-init")
+    docker_services.wait_for_service("redis-cluster-6", 7005, check_redis_cluster_ready)
+
+    if os.environ.get("CI") == "True":
+        time.sleep(10)
+    yield ["localhost", 7000]
+
+
+@pytest.fixture(scope="session")
+def redis_cluster_auth_server(docker_services):
+    docker_services.start("redis-cluster-auth-init")
+    docker_services.wait_for_service(
+        "redis-cluster-auth-1", 8500, lambda h, p: ping_socket("localhost", 8500)
+    )
+
+    if os.environ.get("CI") == "True":
+        time.sleep(10)
+    yield ["localhost", 8500]
+
+
+@pytest.fixture(scope="session")
+def redis_cluster_noreplica_server(docker_services):
+    docker_services.start("redis-cluster-noreplica-init")
+    docker_services.wait_for_service(
+        "redis-cluster-noreplica-3", 8402, check_redis_cluster_ready
+    )
+
+    if os.environ.get("CI") == "True":
+        time.sleep(10)
+    yield ["localhost", 8400]
+
+
+@pytest.fixture(scope="session")
+def redis_ssl_cluster_server(docker_services):
+    docker_services.start("redis-ssl-cluster-init")
+    docker_services.wait_for_service(
+        "redis-ssl-cluster-6", 8306, lambda h, p: ping_socket("localhost", 8306)
+    )
+
+    if os.environ.get("CI") == "True":
+        time.sleep(10)
+    yield ["localhost", 8301]
+
+
+@pytest.fixture(scope="session")
+def redis_stack_cluster_server(docker_services):
+    docker_services.start("redis-stack-cluster-init")
+    docker_services.wait_for_service(
+        "redis-stack-cluster-6", 9005, check_redis_cluster_ready
+    )
+
+    if os.environ.get("CI") == "True":
+        time.sleep(10)
+    yield ["localhost", 9005]
+
+
+@pytest.fixture(scope="session")
+def redis_sentinel_server(docker_services):
+    docker_services.start("redis-sentinel")
+    docker_services.wait_for_service("redis-sentinel", 26379, ping_socket)
+
+    yield ["localhost", 26379]
+
+
+@pytest.fixture(scope="session")
+def redis_sentinel_auth_server(docker_services):
+    docker_services.start("redis-sentinel-auth")
+    docker_services.wait_for_service(
+        "redis-sentinel-auth", 26379, check_sentinel_auth_ready
+    )
+    yield ["localhost", 36379]
+
+
+@pytest.fixture(scope="session")
+def redis_stack_server(docker_services):
+    if os.environ.get("CI") == "True" and not os.environ.get("REDIS_STACK_VERSION"):
+        pytest.skip("Redis stack tests skipped")
+
+    if os.environ.get("CI") == "True":
+        time.sleep(10)
+    docker_services.start("redis-stack")
+    docker_services.wait_for_service("redis-stack", 6379, ping_socket)
+    yield ["localhost", 9379]
+
+
+@pytest.fixture(scope="session")
+def keydb_server(docker_services):
+    docker_services.start("keydb")
+    docker_services.wait_for_service("keydb", 6379, ping_socket)
+
+    if os.environ.get("CI") == "True":
+        time.sleep(10)
+    yield ["localhost", 10379]
+
+
+@pytest.fixture(scope="session")
+def dragonfly_server(docker_services):
+    docker_services.start("dragonfly")
+    docker_services.wait_for_service("dragonfly", 6379, ping_socket)
+    yield ["localhost", 11379]
+
+
+@pytest.fixture(scope="session")
+def keydb_cluster_server(docker_services):
+    docker_services.start("keydb-cluster-init")
+    docker_services.wait_for_service("keydb-cluster-6", 8005, check_redis_cluster_ready)
+
+    if os.environ.get("CI") == "True":
+        time.sleep(10)
+    yield
+
+
+@pytest.fixture
+async def redis_basic(redis_basic_server, request):
+    client = coredis.Redis(
+        "localhost", 6379, decode_responses=True, **get_client_test_args(request)
+    )
+    await check_test_constraints(request, client)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_basic_blocking(redis_basic_server, request):
+    client = coredis.Redis(
+        "localhost",
+        6379,
+        decode_responses=True,
+        connection_pool=BlockingConnectionPool(
+            host="localhost",
+            port=6379,
+            decode_responses=True,
+            **get_client_test_args(request),
+        ),
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, client)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_basic_resp2(redis_basic_server, request):
+    client = coredis.Redis(
+        "localhost",
+        6379,
+        decode_responses=True,
+    )
+    await check_test_constraints(request, client, protocol=2)
+    client = coredis.Redis(
+        "localhost",
+        6379,
+        decode_responses=True,
+        protocol_version=2,
+        **get_client_test_args(request),
+    )
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_stack(redis_stack_server, request):
+    client = coredis.Redis(
+        "localhost", 9379, decode_responses=True, **get_client_test_args(request)
+    )
+    await check_test_constraints(request, client)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_stack_raw(redis_stack_server, request):
+    client = coredis.Redis("localhost", 9379, **get_client_test_args(request))
+    await check_test_constraints(request, client)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_stack_resp2(redis_stack_server, request):
+    client = coredis.Redis(
+        "localhost",
+        9379,
+        decode_responses=True,
+    )
+    await check_test_constraints(request, client, protocol=2)
+    client = coredis.Redis(
+        "localhost",
+        9379,
+        decode_responses=True,
+        protocol_version=2,
+        **get_client_test_args(request),
+    )
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_stack_cached(redis_stack_server, request):
+    cache = TrackingCache(max_size_bytes=-1)
+    client = coredis.Redis(
+        "localhost",
+        9379,
+        decode_responses=True,
+        cache=cache,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, client)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+    client.connection_pool.disconnect()
+    cache.shutdown()
+
+
+@pytest.fixture
+async def redis_stack_raw_resp2(redis_stack_server, request):
+    client = coredis.Redis(
+        "localhost",
+        9379,
+    )
+    await check_test_constraints(request, client, protocol=2)
+    client = coredis.Redis(
+        "localhost",
+        9379,
+        decode_responses=True,
+        protocol_version=2,
+        **get_client_test_args(request),
+    )
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_basic_raw(redis_basic_server, request):
+    client = coredis.Redis(
+        "localhost",
+        6379,
+        decode_responses=False,
+    )
+    await check_test_constraints(request, client)
+    client = coredis.Redis(
+        "localhost", 6379, decode_responses=False, **get_client_test_args(request)
+    )
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_basic_raw_resp2(redis_basic_server, request):
+    client = coredis.Redis(
+        "localhost",
+        6379,
+        decode_responses=False,
+    )
+    await check_test_constraints(request, client, protocol=2)
+    client = coredis.Redis(
+        "localhost",
+        6379,
+        decode_responses=False,
+        protocol_version=2,
+        **get_client_test_args(request),
+    )
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_ssl(redis_ssl_server, request):
+    storage_url = (
+        "rediss://localhost:8379/?ssl_cert_reqs=required"
+        "&ssl_keyfile=./tests/tls/client.key"
+        "&ssl_certfile=./tests/tls/client.crt"
+        "&ssl_ca_certs=./tests/tls/ca.crt"
+    )
+    client = coredis.Redis.from_url(
+        storage_url, decode_responses=True, **get_client_test_args(request)
+    )
+    await check_test_constraints(request, client)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_ssl_resp2(redis_ssl_server, request):
+    storage_url = (
+        "rediss://localhost:8379/?ssl_cert_reqs=required"
+        "&ssl_keyfile=./tests/tls/client.key"
+        "&ssl_certfile=./tests/tls/client.crt"
+        "&ssl_ca_certs=./tests/tls/ca.crt"
+    )
+    client = coredis.Redis.from_url(
+        storage_url, decode_responses=True, **get_client_test_args(request)
+    )
+    await check_test_constraints(request, client, protocol=2)
+    client = coredis.Redis.from_url(
+        storage_url,
+        decode_responses=True,
+        protocol_version=2,
+        **get_client_test_args(request),
+    )
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_auth(redis_auth_server, request):
+    client = coredis.Redis.from_url(
+        f"redis://:sekret@{redis_auth_server[0]}:{redis_auth_server[1]}",
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, client)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_uds(redis_uds_server, request):
+    client = coredis.Redis(
+        unix_socket_path=redis_uds_server,
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, client)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_cached(redis_basic_server, request):
+    cache = TrackingCache(max_size_bytes=-1)
+    client = coredis.Redis(
+        "localhost",
+        6379,
+        decode_responses=True,
+        cache=cache,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, client)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+    cache.shutdown()
+
+
+@pytest.fixture
+async def redis_cached_resp2(redis_basic_server, request):
+    cache = TrackingCache(max_size_bytes=-1)
+    client = coredis.Redis(
+        "localhost",
+        6379,
+        decode_responses=True,
+    )
+    await check_test_constraints(request, client, protocol=2)
+    client = coredis.Redis(
+        "localhost",
+        6379,
+        decode_responses=True,
+        protocol_version=2,
+        cache=cache,
+        **get_client_test_args(request),
+    )
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+    cache.shutdown()
+
+
+@pytest.fixture
+async def redis_cluster(redis_cluster_server, request):
+    cluster = coredis.RedisCluster(
+        "localhost",
+        7000,
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, cluster)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+
+    async with remapped_slots(cluster, request):
+        yield cluster
+
+    cluster.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_cluster_auth(redis_cluster_auth_server, request):
+    cluster = coredis.RedisCluster(
+        "localhost",
+        8500,
+        decode_responses=True,
+        password="sekret",
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, cluster)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+
+    async with remapped_slots(cluster, request):
+        yield cluster
+
+    cluster.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_cluster_blocking(redis_cluster_server, request):
+    pool = coredis.BlockingClusterConnectionPool(
+        startup_nodes=[{"host": "localhost", "port": 7000}],
+        max_connections=32,
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    cluster = coredis.RedisCluster(
+        connection_pool=pool,
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, cluster)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+
+    async with remapped_slots(cluster, request):
+        yield cluster
+
+    cluster.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_cluster_noreplica(redis_cluster_noreplica_server, request):
+    cluster = coredis.RedisCluster(
+        "localhost",
+        8400,
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, cluster)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+
+    async with remapped_slots(cluster, request):
+        yield cluster
+
+    cluster.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_cluster_ssl(redis_ssl_cluster_server, request):
+    storage_url = (
+        "rediss://localhost:8301/?ssl_cert_reqs=required"
+        "&ssl_keyfile=./tests/tls/client.key"
+        "&ssl_certfile=./tests/tls/client.crt"
+        "&ssl_ca_certs=./tests/tls/ca.crt"
+    )
+    cluster = coredis.RedisCluster.from_url(
+        storage_url, decode_responses=True, **get_client_test_args(request)
+    )
+
+    await check_test_constraints(request, cluster)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+    yield cluster
+
+    cluster.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_cluster_cached(redis_cluster_server, request):
+    cache = TrackingCache(max_size_bytes=-1)
+    cluster = coredis.RedisCluster(
+        "localhost",
+        7000,
+        decode_responses=True,
+        cache=cache,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, cluster)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+    yield cluster
+
+    cluster.connection_pool.disconnect()
+    cache.shutdown()
+
+
+@pytest.fixture
+async def redis_cluster_raw(redis_cluster_server, request):
+    cluster = coredis.RedisCluster(
+        "localhost",
+        7000,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, cluster)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+    yield cluster
+
+    cluster.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_cluster_raw_resp2(redis_cluster_server, request):
+    cluster = coredis.RedisCluster(
+        "localhost",
+        7000,
+        decode_responses=False,
+        protocol_version=2,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, cluster, protocol=2)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+    yield cluster
+
+    cluster.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_cluster_resp2(redis_cluster_server, request):
+    cluster = coredis.RedisCluster(
+        "localhost",
+        7000,
+        decode_responses=True,
+        protocol_version=2,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, cluster, protocol=2)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+    yield cluster
+
+    cluster.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_stack_cluster(redis_stack_cluster_server, request):
+    cluster = coredis.RedisCluster(
+        "localhost",
+        9000,
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, cluster)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+
+    async with remapped_slots(cluster, request):
+        yield cluster
+
+    cluster.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def redis_sentinel(redis_sentinel_server, request):
+    sentinel = coredis.sentinel.Sentinel(
+        [redis_sentinel_server],
+        sentinel_kwargs={},
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    master = sentinel.primary_for("mymaster")
+    await check_test_constraints(request, master)
+    await set_default_test_config(sentinel)
+    await master.flushall()
+
+    return sentinel
+
+
+@pytest.fixture
+async def redis_sentinel_resp2(redis_sentinel_server, request):
+    sentinel = coredis.sentinel.Sentinel(
+        [redis_sentinel_server],
+        sentinel_kwargs={},
+        decode_responses=True,
+        protocol_version=2,
+        **get_client_test_args(request),
+    )
+    master = sentinel.primary_for("mymaster")
+    await check_test_constraints(request, master)
+    await set_default_test_config(sentinel)
+    await master.flushall()
+
+    return sentinel
+
+
+@pytest.fixture
+async def redis_sentinel_auth(redis_sentinel_auth_server, request):
+    sentinel = coredis.sentinel.Sentinel(
+        [redis_sentinel_auth_server],
+        sentinel_kwargs={"password": "sekret"},
+        password="sekret",
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    master = sentinel.primary_for("mymaster")
+    await check_test_constraints(request, master)
+    await set_default_test_config(sentinel)
+    await master.flushall()
+    await asyncio.sleep(0.1)
+
+    return sentinel
+
+
+@pytest.fixture
+async def keydb(keydb_server, request):
+    client = coredis.experimental.KeyDB(
+        "localhost", 10379, decode_responses=True, **get_client_test_args(request)
+    )
+    await check_test_constraints(request, client)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def keydb_resp2(keydb_server, request):
+    client = coredis.experimental.KeyDB(
+        "localhost",
+        10379,
+        decode_responses=True,
+    )
+    await check_test_constraints(request, client, protocol=2)
+    client = coredis.experimental.KeyDB(
+        "localhost",
+        10379,
+        decode_responses=True,
+        protocol_version=2,
+        **get_client_test_args(request),
+    )
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture
+async def keydb_cluster(keydb_cluster_server, request):
+    cluster = coredis.experimental.KeyDBCluster(
+        "localhost",
+        8000,
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, cluster)
+    await cluster
+    await cluster.flushall()
+    await cluster.flushdb()
+
+    for primary in cluster.primaries:
+        await set_default_test_config(primary)
+    yield cluster
+
+    cluster.connection_pool.disconnect()
+
+
+@pytest.fixture
+def fake_redis():
+    class _(coredis.client.Redis):
+        responses = {}
+
+        def __init__(self):
+            self.cache = None
+
+        async def initialize(self):
+            pass
+
+        async def execute_command(
+            self,
+            command: bytes,
+            *args: ValueT,
+            callback: Callable[..., R] = NoopCallback(),
+            **options: Optional[ValueT],
+        ) -> R:
+            resp = self.responses.get(command, {}).get(args)
+
+            if isinstance(resp, Exception):
+                raise resp
+
+            return callback(resp, **options)
+
+    return _()
+
+
+@pytest.fixture
+def fake_redis_cluster():
+    class _(coredis.client.RedisCluster):
+        responses = {}
+
+        def __init__(self):
+            self.cache = None
+
+        async def initialize(self):
+            pass
+
+        async def execute_command(
+            self,
+            command: bytes,
+            *args: ValueT,
+            callback: Callable[..., R] = NoopCallback(),
+            **options: Optional[ValueT],
+        ) -> R:
+            resp = self.responses.get(command, {}).get(args)
+
+            if isinstance(resp, Exception):
+                raise resp
+
+            return callback(resp, **options)
+
+    return _()
+
+
+@pytest.fixture
+async def dragonfly(dragonfly_server, request):
+    client = coredis.Redis(
+        "localhost",
+        11379,
+        protocol_version=2,
+        decode_responses=True,
+        **get_client_test_args(request),
+    )
+    await check_test_constraints(request, client, protocol=2)
+    await client.flushall()
+    await set_default_test_config(client)
+
+    yield client
+
+    client.connection_pool.disconnect()
+
+
+@pytest.fixture(scope="session")
+def docker_services_project_name():
+    return "coredis"
+
+
+@pytest.fixture(scope="session")
+def docker_compose_files(pytestconfig):
+    """Get the docker-compose.yml absolute path.
+    Override this fixture in your tests if you need a custom location.
+    """
+
+    return ["docker-compose.yml"]
+
+
+def targets(*targets):
+    return pytest.mark.parametrize(
+        "client",
+        [pytest.param(pytest.lazy_fixture(target)) for target in targets],
+    )
+
+
+@pytest.fixture
+def redis_server_time():
+    async def _get_server_time(client):
+        if isinstance(client, coredis.RedisCluster):
+            await client
+            node = list(client.primaries).pop()
+
+            return await node.time()
+        elif isinstance(client, coredis.Redis):
+            return await client.time()
+
+    return _get_server_time
+
+
+@pytest.fixture
+def _s(client):
+    def str_or_bytes(value):
+        if client.decode_responses:
+            return str(value)
+        else:
+            value = str(value)
+
+            return value.encode(client.encoding)
+
+    return str_or_bytes
+
+
+@pytest.fixture
+def cloner():
+    async def _cloner(client, initialize=True, connection_kwargs={}, **kwargs):
+        if isinstance(client, coredis.client.Redis):
+            c_kwargs = client.connection_pool.connection_kwargs
+            c_kwargs.update(connection_kwargs)
+            c = client.__class__(
+                decode_responses=client.decode_responses,
+                protocol_version=client.protocol_version,
+                encoding=client.encoding,
+                connection_pool=client.connection_pool.__class__(**c_kwargs),
+                **kwargs,
+            )
+        else:
+            c = client.__class__(
+                client.connection_pool.nodes.startup_nodes[0].host,
+                client.connection_pool.nodes.startup_nodes[0].port,
+                decode_responses=client.decode_responses,
+                protocol_version=client.protocol_version,
+                encoding=client.encoding,
+                **kwargs,
+            )
+
+        if initialize:
+            await c.ping()
+
+        return c
+
+    return _cloner
+
+
+@pytest.fixture
+async def user_client(client, cloner):
+    users = set()
+
+    async def _user(name, *permissions):
+        users.add(name)
+        await client.acl_setuser(name, "nopass", *permissions)
+
+        return await cloner(client, connection_kwargs={"username": name}, username=name)
+
+    yield _user
+    assert len(users) == await client.acl_deluser(users)
+
+
+@contextlib.contextmanager
+def server_deprecation_warning(message: str, client, since: str = "1.0"):
+    if version.parse(since) <= REDIS_VERSIONS[str(client)]:
+        with pytest.warns(DeprecationWarning, match=message):
+            yield
+    else:
+        yield
+
+
+def pytest_collection_modifyitems(items):
+    for item in items:
+        if hasattr(item, "callspec") and "client" in item.callspec.params:
+            client_name = item.callspec.params["client"].name
+
+            if client_name.startswith("redis_"):
+                tokens = client_name.replace("redis_", "").split("_")
+
+                for token in tokens:
+                    item.add_marker(getattr(pytest.mark, token))
+            elif client_name.startswith("keydb"):
+                item.add_marker(getattr(pytest.mark, "keydb"))
+                item.add_marker(getattr(pytest.mark, "xfail"))
+                tokens = client_name.replace("keydb_", "").split("_")
+
+                for token in tokens:
+                    item.add_marker(getattr(pytest.mark, token))
+            elif client_name.startswith("dragonfly"):
+                item.add_marker(getattr(pytest.mark, "dragonfly"))
+                tokens = client_name.replace("dragonfly_", "").split("_")
+
+                for token in tokens:
+                    item.add_marker(getattr(pytest.mark, token))

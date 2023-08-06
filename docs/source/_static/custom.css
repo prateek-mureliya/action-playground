@@ -1,0 +1,10 @@
+.badges {
+  display: flex;
+  padding: 5px;
+  flex-direction: rootow;
+  justify-content: center;
+}
+.header-badge {
+  padding: 2px;
+}
+

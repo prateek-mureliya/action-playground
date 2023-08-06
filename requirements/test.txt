@@ -1,0 +1,14 @@
+-r main.txt
+beartype
+coverage
+lovely-pytest-docker
+mock
+numpy
+pytest
+pytest-asyncio
+pytest-cov
+pytest-env
+pytest-lazy-fixture
+pytest-mock
+pytest-reverse
+redis
