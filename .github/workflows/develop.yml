@@ -107,7 +107,7 @@ jobs:
         echo "Runtime checks: $COREDIS_RUNTIME_CHECKS"
         echo "UVLoop: $COREDIS_UVLOOP"
         echo "CI: $CI"
-        pytest -q --reverse --reruns 2 --cov=coredis --cov-report=xml ${{ matrix.test_params }}
+        pytest -q --reverse --reruns 2 --cov=coredis --cov-report=xml ${{ matrix.test_params }} tests/test_connection.py
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v3
   # generate_wheels_matrix:
