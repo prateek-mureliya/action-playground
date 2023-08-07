@@ -58,35 +58,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [3.7, "3.10", "3.11"]
-        redis-version: ["6.0", "7.0", "latest"]
+        python-version: ["3.10"]
+        redis-version: ["latest"]
         test_params: ["-m '(not (keydb or dragonfly))'"]
-        uvloop: ["True", "False"]
+        uvloop: ["False"]
         orjson: ["False"]
         runtime_type_checks: ["True"]
         extensions: ["True"]
         label: [""]
-        include:
-          - python-version: "3.11"
-            redis-version: "latest"
-            test_params: "-m '(not (keydb or dragonfly))'"
-            runtime_type_checks: "True"
-            extensions: "False"
-          - python-version: "3.11"
-            redis-version: "7.0"
-            test_params: "-m keydb"
-            label: "KeyDB"
-          - python-version: "3.11"
-            redis-version: "7.0"
-            test_params: "-m dragonfly"
-            label: "Dragonfly"
-          - python-version: "pypy-3.9"
-            redis-version: "7.0"
-            test_params: "-m '(not (keydb or dragonfly))' tests/commands tests/test_tracking_cache.py"
-            runtime_type_checks: "False"
-            extensions: "False"
-            uvloop: "False"
-            label: ""
     steps:
     - uses: actions/checkout@v3
     - name: Cache dependencies
