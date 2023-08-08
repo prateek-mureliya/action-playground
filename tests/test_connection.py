@@ -11,7 +11,7 @@ from coredis.exceptions import TimeoutError
 pytest_marks = pytest.mark.asyncio
 
 
-async def test_connect_tcp():
+async def test_connect_tcp(redis_basic_server):
     conn = Connection()
     assert conn.host == "127.0.0.1"
     assert conn.port == 6379
